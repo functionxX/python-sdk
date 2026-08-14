@@ -1,113 +1,48 @@
-# PR intake gate: an external pull request stays open only if it links an
-# open issue in this repository (with a closing keyword, e.g. "Fixes #123")
-# AND its author is assigned to that issue — or the issue carries the
-# "help wanted" label, which waives the assignment requirement for everyone.
-# Anything else is labeled "missing-issue-link", gets one explanatory
-# comment, and is closed. Assigning the author to the linked issue later
-# reopens the PR automatically. CONTRIBUTING.md is the human-facing statement
-# of this policy.
+# PR intake gate — see CONTRIBUTING.md ("How pull requests get in") for the
+# policy and .github/scripts/pr_intake_gate.js for the rules as applied.
 #
-# Who is exempt (never gated):
-#   - anyone with triage-or-better on this repo (the python-sdk teams, plus
-#     whoever is granted triage as a trusted contributor via
-#     modelcontextprotocol/access), resolved from the collaborator-permission
-#     endpoint's capability flags — not from role names or
-#     author_association, which hides private org members
-#   - bot accounts (Dependabot, the Claude app, ...)
-#   - draft PRs (checked again on ready_for_review)
-#
-# Grandfathering: PRs numbered below the floor in the job `if:` predate the
-# gate and are left alone unless a maintainer evaluates one by hand via
-# workflow_dispatch. From the floor up, a PR is evaluated on its next event
-# even if it was opened shortly before the gate shipped. Once the gate has
-# labeled a PR it manages it normally regardless of number.
-#
-# Overrides (anyone triage-or-better): reopen the PR, or remove the
-# "missing-issue-link" label. Either applies a sticky "bypass-issue-check"
-# label so later edits don't re-close it. Assigning the linked issue is the
-# ordinary way to admit a PR and is what the bot comment tells authors to
-# wait for.
-#
-# The one state the gate can't fix on its own: GitHub refuses to reopen a PR
-# whose branch was deleted, force-pushed, or recreated while it was closed,
-# or whose branch already has another open PR. The gate detects which,
-# leaves the control label on so the PR stays findable, and replaces its
-# comment with specific instructions.
+# In short: a PR from someone without triage rights stays open only if it links
+# an open issue here that is assigned to them (or labeled `help wanted`);
+# otherwise it is labeled `missing-issue-link`, gets one comment, and is closed,
+# and it reopens automatically once the author is assigned. Bots and drafts are
+# skipped. A triage+ user reopening the PR or removing the label overrides.
 #
 # Operating it:
-#   - Ships in dry-run. Set the repository variable PR_GATE_ENFORCE to "true"
-#     (Settings → Secrets and variables → Actions → Variables) to enforce;
-#     unset or anything else logs the verdict and mutates nothing.
-#   - To evaluate a PR by hand (backfill, or re-run one):
-#     `gh workflow run require-linked-issue.yml -f pr_number=1234`, or
-#     Actions → Require Linked Issue → Run workflow.
+#   - Dry-run until the repository variable PR_GATE_ENFORCE is set to "true".
+#   - PRs below the number in the job `if:` predate the gate and are ignored
+#     unless evaluated by hand: `gh workflow run require-linked-issue.yml -f pr_number=N`.
 #
-# Adapted from PrefectHQ/fastmcp's require-issue-link.yml (Apache-2.0),
-# itself adapted from langchain-ai/langchain's require_issue_link.yml (MIT).
-# Differences from the fastmcp version:
-#   - One job and one script for every entry point (PR events, issue
-#     assignment, manual dispatch), so admission and reopening share exactly
-#     one rule set and one set of helpers.
-#   - PR state is always read live rather than from the event payload, so a
-#     run queued behind another can't act on a stale snapshot.
-#   - Trust comes from capability flags (triage/push) instead of role-name
-#     strings; overrides are honored for triage and above.
-#   - Linked issues must be open and still in this repository.
-#   - Reopen happens before the control label is removed, and a refused
-#     reopen is diagnosed (sibling PR / deleted branch / rewritten branch)
-#     instead of guessed.
-#   - Gated PRs are found by the consistent list endpoint, not Search.
-#   - workflow_dispatch backfill input; PR-number floor for grandfathering;
-#     enforcement is a repository variable rather than an in-file constant.
-#   - The vestigial per-PR "trusted-contributor" label is dropped; the waiver
-#     label is this repo's existing "help wanted".
+# Security: pull_request_target runs with a write token in the base repo's
+# context. This workflow checks out only the default branch (for the script)
+# and never fetches, builds, or runs anything from the pull request.
 #
-# SECURITY: pull_request_target runs with a write-scoped token against the
-# BASE repo. This workflow must NEVER check out or execute PR code. It reads
-# event payloads and calls the GitHub API; nothing from a PR is interpolated
-# into a shell or into the script source.
+# Adapted from PrefectHQ/fastmcp's require-issue-link.yml (Apache-2.0), itself
+# from langchain-ai/langchain (MIT).
 
 name: Require Linked Issue
 
 on:
-  pull_request_target: # zizmor: ignore[dangerous-triggers] never checks out PR code; reads the payload and calls the API only — see header
-    # ready_for_review matters because drafts are skipped: without it a draft
-    # opened with no issue link would never be checked once it's undrafted.
-    # unlabeled is the "removed missing-issue-link" override path.
+  pull_request_target: # zizmor: ignore[dangerous-triggers] checks out the default branch only and never runs PR code — see header
     types: [opened, edited, reopened, ready_for_review, unlabeled]
   issues:
-    # Assignment is what makes a previously closed "not assigned" PR
-    # compliant, so it needs its own path that finds and re-evaluates them.
     types: [assigned]
   workflow_dispatch:
     inputs:
       pr_number:
-        description: PR number to (re-)evaluate against the gate
+        description: PR number to evaluate
         required: true
         type: number
-
-env:
-  # Anything other than the string "true" is a dry run: the check runs and
-  # logs its verdict but performs no label/comment/close/reopen and never
-  # fails the job on a verdict.
-  ENFORCE: ${{ vars.PR_GATE_ENFORCE == 'true' && 'true' || 'false' }}
 
 permissions: {}
 
 jobs:
   gate:
     name: Evaluate
-    # Event routing only; every policy decision lives in the script. For PR
-    # events: at or above the floor, or already carrying (or at this moment
-    # losing) the control label — "once labeled, always managed". Unrelated
-    # label removals are skipped. Issue events: real, open issues only.
+    # Routing only; the rules are in the script. PR events run at or above the
+    # grandfathering floor, or for PRs the gate has already labeled.
     if: >-
       github.event_name == 'workflow_dispatch' ||
-      (
-        github.event_name == 'issues' &&
-        !github.event.issue.pull_request &&
-        github.event.issue.state == 'open'
-      ) ||
+      (github.event_name == 'issues' && !github.event.issue.pull_request && github.event.issue.state == 'open') ||
       (
         github.event_name == 'pull_request_target' &&
         (
@@ -120,361 +55,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     concurrency:
-      group: >-
-        require-linked-issue-${{
-          github.event.pull_request.number
-          || inputs.pr_number
-          || format('issue-{0}', github.event.issue.number)
-        }}
+      group: require-linked-issue-${{ github.event.pull_request.number || inputs.pr_number || format('issue-{0}', github.event.issue.number) }}
       cancel-in-progress: false
     permissions:
-      actions: write # re-run a reopened PR's failed gate check so its status flips to green
-      issues: write # read linked issues; create and apply the control/bypass labels; comment
+      contents: read # check out the gate script from the default branch
+      issues: write # read linked issues; label and comment on the PR
       pull-requests: write # close and reopen the PR
-
+    env:
+      ENFORCE: ${{ vars.PR_GATE_ENFORCE == 'true' && 'true' || 'false' }}
+      PR_NUMBER_INPUT: ${{ inputs.pr_number }}
     steps:
-      - name: Evaluate against the intake gate
+      - name: Check out the gate script (default branch)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts
+
+      - name: Evaluate
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
-        env:
-          PR_NUMBER_INPUT: ${{ inputs.pr_number }}
         with:
           script: |
-            const { owner, repo } = context.repo;
-            const enforce = process.env.ENFORCE === 'true';
-            const LABEL = 'missing-issue-link';
-            const BYPASS_LABEL = 'bypass-issue-check';
-            const MARKER = '<!-- require-linked-issue -->';
-            const BOT_LOGIN = 'github-actions[bot]';
-            // Issue-level label that waives the assignment requirement: "we'd
-            // take a PR for this from anyone". Deliberately not "good first
-            // issue" (a difficulty rating we want to mentor through, so
-            // assignment still applies) and never "ready for work" (triage
-            // state meaning a maintainer will pick it up).
-            const OPEN_LABEL = 'help wanted';
-            const MAX_ISSUES = 5;
-            const CONTRIBUTING = `https://github.com/${owner}/${repo}/blob/main/CONTRIBUTING.md#how-pull-requests-get-in`;
-
-            // ── Helpers ────────────────────────────────────────────────────
-
-            // Dry-run guard: every mutating call goes through this so that a
-            // non-enforcing run is strictly read-only.
-            async function mutate(description, fn) {
-              if (!enforce) {
-                console.log(`[dry-run] would ${description}`);
-                return undefined;
-              }
-              return fn();
-            }
-
-            // Effective capabilities of a user on this repo, from the
-            // collaborator-permission endpoint's boolean flags. These are
-            // cumulative and unaffected by custom role names, unlike
-            // `role_name`; and unlike author_association they see private
-            // org members. On a public repo any existing user resolves (an
-            // outsider gets pull only; an app login gets nothing); only a
-            // nonexistent login 404s. Any other error MUST throw: reading a
-            // rate limit or 5xx as "not trusted" could close a maintainer's
-            // PR. A throw fails the job before any mutation — the safe
-            // direction.
-            const permsCache = new Map();
-            async function permsOf(username) {
-              if (!username) throw new Error('No username — cannot resolve permissions');
-              if (permsCache.has(username)) return permsCache.get(username);
-              let result;
-              try {
-                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username });
-                const p = data.user?.permissions;
-                if (!p) throw new Error(`Permission response for ${username} has no capability flags`);
-                result = { trusted: !!(p.triage || p.push || p.maintain || p.admin) };
-                console.log(`${username}: role_name=${data.role_name || '-'} triage=${p.triage} push=${p.push} → ${result.trusted ? 'trusted' : 'not trusted'}`);
-              } catch (e) {
-                if (e.status !== 404) {
-                  throw new Error(`Permission check failed for ${username} (HTTP ${e.status ?? 'unknown'}): ${e.message}`);
-                }
-                console.log(`${username}: no such user`);
-                result = { trusted: false };
-              }
-              permsCache.set(username, result);
-              return result;
-            }
-            const isTrusted = async (u) => (await permsOf(u)).trusted;
-
-            // Same reference forms GitHub honors for auto-close: bare #123,
-            // owner/repo#123, and the full issue URL — qualified forms scoped
-            // to THIS repo, since GitHub only auto-closes same-repo issues.
-            const repoRef = `${owner}/${repo}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const closingRef = new RegExp(
-              '\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s*:?\\s*' +
-                `(?:${repoRef}#|#|https?://github\\.com/${repoRef}/issues/)(\\d+)`,
-              'gi',
-            );
-            const closingRefs = (body) => [...new Set([...(body || '').matchAll(closingRef)].map(m => parseInt(m[1], 10)))];
-
-            async function ensureLabel(name, color, description) {
-              try {
-                await github.rest.issues.getLabel({ owner, repo, name });
-              } catch (e) {
-                if (e.status !== 404) throw e;
-                try {
-                  await github.rest.issues.createLabel({ owner, repo, name, color, description });
-                } catch (createErr) {
-                  if (createErr.status !== 422) throw createErr; // created concurrently
-                }
-              }
-            }
-            async function addLabel(prNumber, name) {
-              const meta = name === LABEL
-                ? ['b76e79', 'Auto-closed: PR must link an open issue assigned to its author (see CONTRIBUTING.md)']
-                : ['0e8a16', 'Maintainer override: exempt from the linked-issue intake gate'];
-              await mutate(`add "${name}" to PR #${prNumber}`, async () => {
-                await ensureLabel(name, ...meta);
-                await github.rest.issues.addLabels({ owner, repo, issue_number: prNumber, labels: [name] });
-              });
-            }
-            async function removeLabel(prNumber, name) {
-              await mutate(`remove "${name}" from PR #${prNumber}`, async () => {
-                try {
-                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name });
-                } catch (e) {
-                  if (e.status !== 404) throw e;
-                }
-              });
-            }
-
-            // The gate keeps exactly one comment per PR, identified by MARKER
-            // and authored by the Actions bot (so an author can't plant one).
-            // Its body is replaced as the PR's situation changes and it is
-            // collapsed once the PR passes.
-            async function findMarkerComment(prNumber) {
-              const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
-              return comments.find(c => c.user?.login === BOT_LOGIN && c.body?.includes(MARKER));
-            }
-            async function setCommentMinimized(comment, minimized) {
-              const mutation = minimized
-                ? 'mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { clientMutationId } }'
-                : 'mutation($id: ID!) { unminimizeComment(input: {subjectId: $id}) { clientMutationId } }';
-              try {
-                await mutate(`${minimized ? 'minimize' : 'unminimize'} comment ${comment.id}`, () => github.graphql(mutation, { id: comment.node_id }));
-              } catch (e) {
-                core.warning(`Could not ${minimized ? 'minimize' : 'unminimize'} comment ${comment.id}: ${e.message}`);
-              }
-            }
-            async function upsertMarkerComment(prNumber, body) {
-              const existing = await findMarkerComment(prNumber);
-              if (!existing) {
-                await mutate(`comment on PR #${prNumber}`, () => github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body }));
-                return;
-              }
-              if (existing.body !== body) {
-                await mutate(`update comment ${existing.id}`, () => github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body }));
-              }
-              await setCommentMinimized(existing, false);
-            }
-            async function retireMarkerComment(prNumber) {
-              const existing = await findMarkerComment(prNumber);
-              if (existing) await setCommentMinimized(existing, true);
-            }
-
-            // Reopen a gate-closed PR, or explain precisely why GitHub won't.
-            // Returns true if the PR is (or in dry-run would be) open.
-            async function reopenOrExplain(pr, lead) {
-              try {
-                await mutate(`reopen PR #${pr.number}`, () => github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'open' }));
-                return true;
-              } catch (e) {
-                if (e.status !== 422) throw e;
-                let reason = 'rewritten';
-                let sibling = null;
-                if (!pr.head.repo) {
-                  reason = 'branch-gone';
-                } else {
-                  const headOwner = pr.head.repo.owner.login;
-                  const { data: siblings } = await github.rest.pulls.list({ owner, repo, state: 'open', head: `${headOwner}:${pr.head.ref}`, per_page: 5 });
-                  if (siblings.length) {
-                    reason = 'sibling';
-                    sibling = siblings[0].number;
-                  } else {
-                    try {
-                      await github.rest.repos.getBranch({ owner: headOwner, repo: pr.head.repo.name, branch: pr.head.ref });
-                    } catch (b) {
-                      if (b.status === 404) reason = 'branch-gone';
-                      else core.warning(`Could not inspect ${headOwner}:${pr.head.ref}: ${b.message}`);
-                    }
-                  }
-                }
-                core.warning(`GitHub refused to reopen PR #${pr.number} (422: ${e.message}); diagnosed as ${reason}${sibling ? ` #${sibling}` : ''}`);
-                const detail = {
-                  sibling: `it can't be reopened because #${sibling}, from the same branch, is already open. Continue there — please don't open another.`,
-                  'branch-gone': "it can't be reopened because the branch (or fork) it came from has been deleted. This is the one situation where opening a new PR is the right move: include `Fixes #<issue>` in its description and it will stay open.",
-                  rewritten: `it can't be reopened because the branch was force-pushed or recreated while the PR was closed, and GitHub won't reopen a PR in that state. Either push the branch back to \`${pr.head.sha.slice(0, 7)}\` and edit this PR's description to retry, or open a new PR with \`Fixes #<issue>\` in its description.`,
-                }[reason];
-                await upsertMarkerComment(pr.number, [MARKER, `${lead}, but ${detail}`].join('\n'));
-                return false;
-              }
-            }
-
-            function enforcementComment(kind, issues) {
-              const issueList = issues.map(n => `#${n}`).join(', ');
-              const why = kind === 'no-link'
-                ? "its description doesn't link an open issue in this repository with a closing keyword (`Fixes #123`)"
-                : `you aren't assigned to ${issueList}`;
-              const steps = kind === 'no-link'
-                ? [
-                    `1. Find or [open an issue](https://github.com/${owner}/${repo}/issues/new/choose) describing the problem. A clear, reproducible issue is the most useful thing you can give us — usually more useful than the patch itself.`,
-                    "2. Add `Fixes #<issue>` (or `Closes` / `Resolves`) to **this** PR's description.",
-                    "3. If a maintainer wants this change as a PR from you, they'll assign you the issue and this PR reopens automatically.",
-                  ]
-                : [
-                    `1. If you opened ${issueList}: this PR already shows on the issue's timeline, so whoever triages it will see that a fix exists and can assign you. There's nothing else you need to do; if that happens this PR reopens automatically.`,
-                    '2. If someone else opened it, this PR reopens only if a maintainer chooses to assign the issue to you.',
-                  ];
-              return [
-                MARKER,
-                `Thanks for the PR. It's been closed automatically because ${why}. **Please don't open a new one** — this PR reopens on its own once that's resolved, and duplicates just create more to triage. While it's closed, push fixes as new commits rather than force-pushing: GitHub can't reopen a PR whose branch was rewritten.`,
-                '',
-                `We're a small maintainer team and only review pull requests we've asked for; [CONTRIBUTING.md](${CONTRIBUTING}) explains why and what we do welcome. To have this PR considered:`,
-                '',
-                ...steps,
-                '',
-                "Please don't comment on the issue just to ask for assignment — a bare claim doesn't change the outcome and it's the most common noise we get.",
-                '',
-                `*Maintainers: reopen this PR or remove the \`${LABEL}\` label to bypass the check.*`,
-              ].join('\n');
-            }
-
-            // ── The rule set ───────────────────────────────────────────────
-            // Evaluates one PR. `action` is the PR event action, or 'dispatch'
-            // / 'assigned' for the other entry points; `sender` is whoever
-            // caused the event. Returns 'skipped' | 'passed' | 'failed' |
-            // 'stuck' (passes, but GitHub refused to reopen it).
-            async function evaluate(prNumber, action, sender) {
-              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-              const labels = pr.labels.map(l => l.name);
-              // The job `if:` restricts unlabeled runs to LABEL, so that event
-              // itself proves the label was ours a moment ago.
-              const hadLabel = action === 'unlabeled' || labels.includes(LABEL);
-              console.log(`PR #${prNumber} by ${pr.user.login} (${pr.state}${pr.draft ? ', draft' : ''}) — ${context.eventName}/${action} by ${sender ?? '-'}, enforce=${enforce}`);
-
-              // The gate manages open PRs and PRs it closed itself (marked by
-              // the control label). A PR someone closed for other reasons is
-              // not ours to label, comment on, or reopen.
-              if (pr.state === 'closed' && !hadLabel) {
-                console.log('Closed without the control label — not gate-managed, leaving it alone');
-                return 'skipped';
-              }
-
-              async function pass(reason, { bypass = false } = {}) {
-                console.log(`PASS: ${reason}`);
-                if (bypass) await addLabel(prNumber, BYPASS_LABEL); // sticky, and first, so it holds even if the reopen is refused
-                if (pr.state === 'closed' && !(await reopenOrExplain(pr, `This PR now passes the intake gate (${reason})`))) return 'stuck';
-                if (hadLabel) {
-                  await removeLabel(prNumber, LABEL);
-                  await retireMarkerComment(prNumber);
-                }
-                return 'passed';
-              }
-              async function fail(kind, issues = []) {
-                const verdict = kind === 'no-link'
-                  ? 'PR must link an open issue in this repository using a closing keyword (e.g. "Fixes #123").'
-                  : `PR author must be assigned to the linked issue (${issues.map(n => `#${n}`).join(', ')}).`;
-                console.log(`FAIL: ${verdict}`);
-                await addLabel(prNumber, LABEL);
-                await upsertMarkerComment(prNumber, enforcementComment(kind, issues));
-                if (pr.state === 'open') {
-                  await mutate(`close PR #${prNumber}`, () => github.rest.pulls.update({ owner, repo, pull_number: prNumber, state: 'closed' }));
-                }
-                if (enforce && action !== 'assigned') core.setFailed(verdict);
-                return 'failed';
-              }
-
-              // Author exemptions.
-              if (pr.user.type === 'Bot') {
-                console.log(`Author ${pr.user.login} is a bot — exempt`);
-                return 'skipped';
-              }
-              if (await isTrusted(pr.user.login)) return pass(`author ${pr.user.login} is trusted`);
-              if (pr.draft) {
-                console.log('Draft — skipped until ready_for_review');
-                return 'skipped';
-              }
-
-              // Overrides: a trusted person removing the control label or
-              // reopening the PR means "I want this open"; re-closing it
-              // seconds later would be the surprising outcome. An untrusted
-              // actor (or another bot) doing either just gets re-evaluated.
-              if ((action === 'unlabeled' || action === 'reopened') && sender && (await isTrusted(sender))) {
-                return pass(`${sender} ${action === 'unlabeled' ? `removed ${LABEL}` : 'reopened the PR'} — bypassing`, { bypass: true });
-              }
-              if (labels.includes(BYPASS_LABEL)) return pass(`carries ${BYPASS_LABEL}`);
-
-              // The check: a closing-keyword reference to an open, same-repo
-              // issue that is either open-call or assigned to the author.
-              const refs = closingRefs(pr.body);
-              if (refs.length > MAX_ISSUES) core.warning(`PR references ${refs.length} issues — checking only the first ${MAX_ISSUES}`);
-              const author = pr.user.login.toLowerCase();
-              const usable = [];
-              for (const num of refs.slice(0, MAX_ISSUES)) {
-                let issue;
-                try {
-                  ({ data: issue } = await github.rest.issues.get({ owner, repo, issue_number: num }));
-                } catch (e) {
-                  // Same safe-direction rule as permsOf: a transient error
-                  // must not be read as "not assigned" and close the PR.
-                  if (e.status !== 404 && e.status !== 410) throw new Error(`Cannot fetch issue #${num} (HTTP ${e.status ?? 'unknown'}): ${e.message}`);
-                  console.log(`#${num}: does not exist — ignoring`);
-                  continue;
-                }
-                if (issue.pull_request) { console.log(`#${num}: is a pull request — ignoring`); continue; }
-                if (issue.state !== 'open') { console.log(`#${num}: is ${issue.state} — ignoring`); continue; }
-                if (!issue.repository_url?.endsWith(`/${owner}/${repo}`)) { console.log(`#${num}: was transferred elsewhere — ignoring`); continue; }
-                usable.push(num);
-                const issueLabels = issue.labels.map(l => (typeof l === 'string' ? l : l?.name)).filter(Boolean).map(n => n.toLowerCase());
-                if (issueLabels.includes(OPEN_LABEL)) return pass(`#${num} is labeled "${OPEN_LABEL}" — assignment not required`);
-                const assignees = (issue.assignees || []).map(a => a.login.toLowerCase());
-                if (assignees.includes(author)) return pass(`author is assigned to #${num}`);
-                console.log(`#${num}: author not assigned (assignees: ${assignees.join(', ') || 'none'})`);
-              }
-              return usable.length ? fail('not-assigned', usable) : fail('no-link');
-            }
-
-            // ── Entry points ───────────────────────────────────────────────
-            if (context.eventName === 'issues') {
-              // Someone was assigned to an issue: re-evaluate every PR the
-              // gate closed for that person which references it. Uses the
-              // list endpoint (consistent) rather than Search (index lag).
-              const issueNumber = context.payload.issue.number;
-              const assignee = context.payload.assignee.login;
-              console.log(`#${issueNumber} assigned to ${assignee} — looking for their gate-closed PRs that reference it (enforce=${enforce})`);
-              const closed = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: 'closed', creator: assignee, labels: LABEL, per_page: 100 });
-              const candidates = closed.filter(i => i.pull_request && closingRefs(i.body).includes(issueNumber));
-              if (!candidates.length) { console.log('None found'); return; }
-              for (const c of candidates) {
-                const outcome = await evaluate(c.number, 'assigned', context.payload.sender?.login);
-                if (outcome !== 'passed') continue;
-                // Events made with GITHUB_TOKEN don't trigger workflows, so
-                // the reopen won't re-run the check by itself. Re-run the
-                // last failed run for the head SHA so the PR's red X flips.
-                try {
-                  const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: c.number });
-                  const { data: runs } = await github.rest.actions.listWorkflowRuns({ owner, repo, workflow_id: 'require-linked-issue.yml', head_sha: pr.head.sha, status: 'failure', per_page: 1 });
-                  if (!runs.workflow_runs.length) { console.log(`No failed gate run to re-run for PR #${c.number}`); continue; }
-                  await mutate(`re-run failed gate run for PR #${c.number}`, () => github.rest.actions.reRunWorkflowFailedJobs({ owner, repo, run_id: runs.workflow_runs[0].id }));
-                } catch (e) {
-                  core.warning(`Could not re-run the gate check for PR #${c.number}: ${e.message}`);
-                }
-              }
-              return;
-            }
-
-            let prNumber;
-            let action;
-            if (context.eventName === 'workflow_dispatch') {
-              prNumber = parseInt(process.env.PR_NUMBER_INPUT, 10);
-              if (!Number.isInteger(prNumber) || prNumber <= 0) throw new Error(`Bad pr_number input: ${process.env.PR_NUMBER_INPUT}`);
-              action = 'dispatch';
-            } else {
-              prNumber = context.payload.pull_request.number;
-              action = context.payload.action;
-            }
-            const outcome = await evaluate(prNumber, action, context.payload.sender?.login);
-            if (outcome === 'stuck' && enforce) core.setFailed(`PR #${prNumber} passes the gate but GitHub refused to reopen it; see the bot comment on the PR.`);
+            const run = require('./.github/scripts/pr_intake_gate.js');
+            await run({ github, context, core });
