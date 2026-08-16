@@ -41,6 +41,9 @@ jobs:
         with:
           extra_args: --all-files --verbose
 
+      - name: PR intake gate scenarios
+        run: node --test .github/scripts/pr_intake_gate.test.js
+
       - name: Surface types match vendored schema
         run: |
           uv sync --group codegen --frozen

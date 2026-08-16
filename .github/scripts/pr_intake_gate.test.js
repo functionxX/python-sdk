@@ -5,7 +5,7 @@
 //   node --test .github/scripts/pr_intake_gate.test.js
 //
 // No dependencies; the GitHub client is a small fake defined at the bottom.
-// pre-commit runs this whenever the gate script or this file changes.
+// CI runs it in the checks job (.github/workflows/shared.yml).
 'use strict';
 
 const test = require('node:test');
