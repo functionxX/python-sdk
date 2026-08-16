@@ -5,7 +5,8 @@
 # an open issue here that is assigned to them (or labeled `help wanted`);
 # otherwise it is labeled `missing-issue-link`, gets one comment, and is closed,
 # and it reopens automatically once the author is assigned. Bots and drafts are
-# skipped. A triage+ user reopening the PR or removing the label overrides.
+# skipped. A triage+ user reopening the PR, removing the label, or adding
+# `bypass-issue-check` overrides.
 #
 # Operating it:
 #   - Dry-run until the repository variable PR_GATE_ENFORCE is set to "true".
@@ -25,7 +26,7 @@ name: Require Linked Issue
 
 on:
   pull_request_target: # zizmor: ignore[dangerous-triggers] checks out the default branch only and never runs PR code — see header
-    types: [opened, edited, reopened, ready_for_review, unlabeled]
+    types: [opened, edited, reopened, ready_for_review, labeled, unlabeled]
   issues:
     types: [assigned]
   workflow_dispatch:
@@ -41,7 +42,8 @@ jobs:
   gate:
     name: Evaluate
     # Routing only; the rules are in the script. PR events run at or above the
-    # grandfathering floor, or for PRs the gate has already labeled.
+    # grandfathering floor, or for PRs the gate has already labeled; label
+    # events only for the two labels the gate cares about.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issues' && !github.event.issue.pull_request && github.event.issue.state == 'open') ||
@@ -52,7 +54,8 @@ jobs:
           contains(github.event.pull_request.labels.*.name, 'missing-issue-link') ||
           github.event.action == 'unlabeled'
         ) &&
-        (github.event.action != 'unlabeled' || github.event.label.name == 'missing-issue-link')
+        (github.event.action != 'unlabeled' || github.event.label.name == 'missing-issue-link') &&
+        (github.event.action != 'labeled' || github.event.label.name == 'bypass-issue-check')
       )
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -6,8 +6,9 @@
 // is either assigned to the PR author or labeled `help wanted`. Otherwise the
 // gate labels it `missing-issue-link`, leaves one comment, and closes it. It
 // re-evaluates — and reopens — the PR when the description is edited or the
-// author is assigned to the issue. A triage+ user reopening the PR or removing
-// the label is a sticky override (`bypass-issue-check`).
+// author is assigned to the issue. A triage+ user reopening the PR, removing
+// the label, or adding `bypass-issue-check` overrides it, and the override
+// sticks.
 //
 // Everything that writes goes through mutate(), so with ENFORCE unset the run
 // only logs what it would have done.
@@ -37,7 +38,7 @@ module.exports = async function run({ github, context, core }) {
     });
     const prs = closed.filter((i) => i.pull_request && closingRefs(i.body).includes(issueNumber));
     console.log(`#${issueNumber} assigned to ${assignee}: ${prs.length} gate-closed PR(s) reference it`);
-    for (const pr of prs) await evaluate(pr.number, 'assigned', context.payload.sender?.login);
+    for (const pr of prs) await evaluate(pr.number, 'assigned', context.payload.sender?.login, issueNumber);
     return;
   }
 
@@ -52,7 +53,7 @@ module.exports = async function run({ github, context, core }) {
 
   // ── The rules ────────────────────────────────────────────────────────────
 
-  async function evaluate(prNumber, action, sender) {
+  async function evaluate(prNumber, action, sender, hintIssue = null) {
     // Always read the PR live; the event payload can be stale by the time a
     // queued run starts.
     const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -81,10 +82,13 @@ module.exports = async function run({ github, context, core }) {
     if (labels.includes(BYPASS_LABEL)) return pass(`carries ${BYPASS_LABEL}`);
 
     // 3. The rule: the description links an open issue in this repo that is
-    //    labeled `help wanted` or assigned to the author.
+    //    labeled `help wanted` or assigned to the author. Only the first few
+    //    references are fetched; a just-assigned issue is checked first.
     const author = pr.user.login.toLowerCase();
+    const refs = closingRefs(pr.body);
+    if (hintIssue && refs.includes(hintIssue)) refs.unshift(...refs.splice(refs.indexOf(hintIssue), 1));
     const linked = [];
-    for (const num of closingRefs(pr.body).slice(0, MAX_ISSUES)) {
+    for (const num of refs.slice(0, MAX_ISSUES)) {
       const issue = await getIssue(num);
       if (!issue) continue; // missing, a PR, closed, or transferred away
       linked.push(num);
@@ -205,9 +209,9 @@ module.exports = async function run({ github, context, core }) {
   }
 
   // Reopen a gate-closed PR. GitHub refuses (422) if the branch was rewritten
-  // or deleted while closed, or another open PR uses it. That state is
-  // terminal for this PR, so just explain it in the comment; the control
-  // label is left as it is (still on, unless a maintainer removed it).
+  // or deleted while closed, or another open PR uses it. Explain that in the
+  // comment and make sure the control label is (still) on, so the PR stays
+  // gate-managed and a later edit or override retries the reopen.
   async function reopen(pr, reason) {
     try {
       await mutate(`reopen PR #${pr.number}`, () => github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'open' }));
@@ -215,6 +219,7 @@ module.exports = async function run({ github, context, core }) {
     } catch (e) {
       if (e.status !== 422) throw e;
       core.warning(`GitHub refused to reopen PR #${pr.number}: ${e.message}`);
+      await addLabel(pr.number, LABEL);
       await upsertGateComment(pr.number, cannotReopenComment(pr, reason));
       return false;
     }
@@ -272,6 +277,13 @@ module.exports = async function run({ github, context, core }) {
 
   async function deleteGateComment(prNumber) {
     const existing = await findGateComment(prNumber);
-    if (existing) await mutate(`delete the gate comment on PR #${prNumber}`, () => github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id }));
+    if (!existing) return;
+    await mutate(`delete the gate comment on PR #${prNumber}`, async () => {
+      try {
+        await github.rest.issues.deleteComment({ owner, repo, comment_id: existing.id });
+      } catch (e) {
+        if (e.status !== 404) throw e; // already deleted by a concurrent run
+      }
+    });
   }
 };

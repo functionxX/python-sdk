@@ -181,6 +181,31 @@ const scenarios = [
     expect: { 3300: { state: 'closed', labels: [LABEL], comment: 'cannot-reopen' } },
   },
   {
+    name: 'gate-closed PR: maintainer adds the bypass label → reopened, and the label sticks',
+    prs: [pr(3300, 'outsider', { state: 'closed', labels: [LABEL, BYPASS], gateComment: true })], // payload arrives post-label
+    event: labeled(3300, 'maintainer', BYPASS),
+    expect: { 3300: { state: 'open', labels: [BYPASS], comment: null } },
+  },
+  {
+    name: 'refused reopen after a label-removal override → both labels on, so the PR stays gate-managed',
+    prs: [pr(3300, 'outsider', { state: 'closed', labels: [], gateComment: true, refuseReopen: true })],
+    event: unlabeled(3300, 'triager'),
+    expect: { 3300: { state: 'closed', labels: [BYPASS, LABEL], comment: 'cannot-reopen' } },
+  },
+  {
+    name: 'after a refused reopen, once the branch is restored an edit retries and reopens',
+    prs: [pr(3300, 'outsider', { state: 'closed', labels: [BYPASS, LABEL], comments: [{ user: 'github-actions[bot]', body: "<!-- require-linked-issue -->\n…GitHub won't let it be reopened…" }] })],
+    event: edited(3300, 'outsider'),
+    expect: { 3300: { state: 'open', labels: [BYPASS], comment: null } },
+  },
+  {
+    name: 'assignment reopens the PR even when the assigned issue is referenced after several others',
+    prs: [pr(3300, 'outsider', { state: 'closed', labels: [LABEL], body: 'Fixes #1 fixes #2 fixes #3 fixes #4 fixes #5 fixes #6', gateComment: true })],
+    issues: [issue(1), issue(2), issue(3), issue(4), issue(5), issue(6, { assignees: ['outsider'] })],
+    event: assigned(6, 'outsider', 'maintainer'),
+    expect: { 3300: { state: 'open', labels: [], comment: null } },
+  },
+  {
     name: 'a comment planted by the author with the marker is ignored; the gate posts its own',
     prs: [pr(3300, 'outsider', { comments: [{ user: 'outsider', body: '<!-- require-linked-issue -->\nnice try' }] })],
     event: opened(3300, 'outsider'),
@@ -234,6 +259,7 @@ function edited(number, sender) { return prEvent('edited', number, sender); }
 function reopened(number, sender) { return prEvent('reopened', number, sender); }
 function readyForReview(number, sender) { return prEvent('ready_for_review', number, sender); }
 function unlabeled(number, sender) { return prEvent('unlabeled', number, sender, { label: { name: LABEL } }); }
+function labeled(number, sender, name) { return prEvent('labeled', number, sender, { label: { name } }); }
 function assigned(issueNumber, assignee, sender) {
   return { eventName: 'issues', payload: { action: 'assigned', issue: { number: issueNumber }, assignee: { login: assignee }, sender: { login: sender } } };
 }
