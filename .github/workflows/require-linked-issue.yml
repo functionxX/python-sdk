@@ -13,8 +13,10 @@
 #     unless evaluated by hand: `gh workflow run require-linked-issue.yml -f pr_number=N`.
 #
 # Security: pull_request_target runs with a write token in the base repo's
-# context. This workflow checks out only the default branch (for the script)
-# and never fetches, builds, or runs anything from the pull request.
+# context, and GitHub takes both this file and the checkout from the default
+# branch whatever the PR targets (so PRs against v1.x are covered too). The
+# job checks out only that, for the script, and never fetches, builds, or runs
+# anything from the pull request.
 #
 # Adapted from PrefectHQ/fastmcp's require-issue-link.yml (Apache-2.0), itself
 # from langchain-ai/langchain (MIT).

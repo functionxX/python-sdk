@@ -62,8 +62,9 @@ module.exports = async function run({ github, context, core }) {
     const gated = action === 'unlabeled' || labels.includes(LABEL);
     console.log(`PR #${prNumber} by ${pr.user.login} (${pr.state}${pr.draft ? ', draft' : ''}) — ${action} by ${sender ?? '-'}, enforce=${enforce}`);
 
-    // 0. Scope: open PRs, plus closed PRs the gate closed itself. A PR someone
-    //    closed for other reasons is left alone.
+    // 0. Scope: open PRs, plus closed PRs the gate closed itself. Merged PRs
+    //    and PRs someone closed for other reasons are left alone.
+    if (pr.merged_at) return log('merged — nothing to do');
     if (pr.state === 'closed' && !gated) return log('closed by someone else — not ours');
 
     // 1. Exempt authors: bots, anyone with triage or better, and drafts (which
@@ -87,7 +88,7 @@ module.exports = async function run({ github, context, core }) {
       const issue = await getIssue(num);
       if (!issue) continue; // missing, a PR, closed, or transferred away
       linked.push(num);
-      if (issue.labels.some((l) => (l.name ?? l).toLowerCase() === OPEN_LABEL)) return pass(`#${num} is labeled "${OPEN_LABEL}"`);
+      if (issue.labels.some((l) => l.name.toLowerCase() === OPEN_LABEL)) return pass(`#${num} is labeled "${OPEN_LABEL}"`);
       if (issue.assignees.some((a) => a.login.toLowerCase() === author)) return pass(`author is assigned to #${num}`);
     }
     return fail(linked);
@@ -136,7 +137,7 @@ module.exports = async function run({ github, context, core }) {
       '',
       "There's no need to open a new PR — this one will be reopened. While it's closed, please push any updates as new commits rather than force-pushing, since GitHub can't reopen a PR whose branch has been rewritten.",
       '',
-      `*Maintainers: reopening this PR or removing the \`${LABEL}\` label bypasses the check.*`,
+      `*Maintainers: reopening this PR, removing the \`${LABEL}\` label, or adding \`${BYPASS_LABEL}\` bypasses the check.*`,
     ].join('\n');
   }
 
@@ -204,8 +205,9 @@ module.exports = async function run({ github, context, core }) {
   }
 
   // Reopen a gate-closed PR. GitHub refuses (422) if the branch was rewritten
-  // or deleted while closed, or another open PR uses it; in that case keep
-  // the label so the PR stays findable and explain in the comment.
+  // or deleted while closed, or another open PR uses it. That state is
+  // terminal for this PR, so just explain it in the comment; the control
+  // label is left as it is (still on, unless a maintainer removed it).
   async function reopen(pr, reason) {
     try {
       await mutate(`reopen PR #${pr.number}`, () => github.rest.pulls.update({ owner, repo, pull_number: pr.number, state: 'open' }));

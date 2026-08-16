@@ -48,6 +48,12 @@ repos:
         language: system
         types: [python]
         pass_filenames: false
+      - id: pr-intake-gate
+        name: PR intake gate scenarios
+        entry: node --test .github/scripts/pr_intake_gate.test.js
+        language: system
+        files: ^\.github/scripts/pr_intake_gate
+        pass_filenames: false
       - id: uv-lock-check
         name: Check uv.lock is up to date
         entry: uv lock --check
